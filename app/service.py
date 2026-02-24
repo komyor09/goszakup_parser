@@ -1,7 +1,6 @@
 """
-Сервис: сохранение лотов в БД, логирование запусков.
+Сервис: сохранение лотов в БД + журналирование запусков.
 """
-
 from datetime import datetime
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,8 +15,9 @@ logger = get_logger("goszakup.service")
 
 def run_parse_job():
     """
-    Основная задача: парсим сайт и сохраняем новые лоты в БД.
-    Регистрируем запуск в parse_runs.
+    Основная задача планировщика.
+    Парсим ВСЕ страницы реестра лотов и сохраняем НОВЫЕ в БД.
+    Дубли определяются по unique_hash — пропускаем без ошибки.
     """
     db: Session = SessionLocal()
     run = ParseRun(started_at=datetime.utcnow(), status="running")
@@ -27,49 +27,67 @@ def run_parse_job():
 
     lots_found = 0
     lots_new = 0
-    pages_parsed = 0
+    pages_seen = set()
 
-    logger.info(f"=== Старт парсинга (run_id={run.id}) ===")
+    logger.info(f"╔═══ СТАРТ ПАРСИНГА (run_id={run.id}) ═══")
 
     try:
-        prev_page = None
         for lot_data in parse_all_lots():
-            # Определяем номер страницы из raw для подсчёта
             lots_found += 1
 
-            # Проверяем дубль по unique_hash
-            existing = (
-                db.query(Lot)
+            # Проверка дубля
+            exists = (
+                db.query(Lot.id)
                 .filter(Lot.unique_hash == lot_data["unique_hash"])
                 .first()
             )
-            if existing:
+            if exists:
                 continue
 
-            # Новый лот
-            lot = Lot(**lot_data)
+            # Сохраняем новый лот
+            lot = Lot(
+                unique_hash=lot_data["unique_hash"],
+                lot_number=lot_data.get("lot_number"),
+                announce_number=lot_data.get("announce_number"),
+                announce_name=lot_data.get("announce_name"),
+                lot_name=lot_data.get("lot_name"),
+                subject_type=lot_data.get("subject_type"),
+                quantity=lot_data.get("quantity"),
+                status=lot_data.get("status"),
+                purchase_method=lot_data.get("purchase_method"),
+                customer_name=lot_data.get("customer_name"),
+                customer_bin=lot_data.get("customer_bin"),
+                purchase_amount=lot_data.get("purchase_amount"),
+                deadline_date=lot_data.get("deadline_date"),
+                publication_date=lot_data.get("publication_date"),
+                financial_year=lot_data.get("financial_year"),
+                delivery_place=lot_data.get("delivery_place"),
+                lot_url=lot_data.get("lot_url"),
+                raw_data=lot_data.get("raw_data"),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
             db.add(lot)
             try:
                 db.commit()
                 lots_new += 1
-                logger.debug(
-                    f"  + Новый лот: {lot_data.get('lot_number')} / "
-                    f"{lot_data.get('lot_name', '')[:60]}"
-                )
+                if lots_new % 100 == 0:
+                    logger.info(f"  Сохранено новых лотов: {lots_new} (всего обработано: {lots_found})")
             except IntegrityError:
                 db.rollback()
-                logger.debug(f"  ~ Дубль (race): {lot_data.get('unique_hash')}")
 
-        # Обновляем run
+        # Финал
         run.status = "success"
         run.finished_at = datetime.utcnow()
         run.lots_found = lots_found
         run.lots_new = lots_new
         db.commit()
 
+        duration = (run.finished_at - run.started_at).seconds
         logger.info(
-            f"=== Парсинг завершён (run_id={run.id}): "
-            f"найдено={lots_found}, новых={lots_new} ==="
+            f"╚═══ ПАРСИНГ ЗАВЕРШЁН (run_id={run.id}) | "
+            f"найдено={lots_found} | новых={lots_new} | "
+            f"время={duration}с ═══"
         )
 
     except Exception as e:

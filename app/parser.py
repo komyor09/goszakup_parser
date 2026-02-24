@@ -1,8 +1,16 @@
 """
-Парсер реестра лотов goszakup.gov.kz.
+Парсер реестра лотов goszakup.gov.kz
 
-Использует Selenium для рендеринга JS-страниц.
-Поддерживает пагинацию: обходит все страницы до последней.
+Реальная структура таблицы (6 колонок):
+  [0] № лота + номер объявления + заказчик (всё в одной ячейке через многострочный HTML)
+  [1] Наименование и описание лота (ссылка)
+  [2] Кол-во
+  [3] Сумма, тг.
+  [4] Способ закупки
+  [5] Статус
+
+Пагинация: ?page=N, максимум 10 000 записей (200 страниц по 50).
+Парсер использует Selenium т.к. сайт рендерится через JavaScript.
 """
 
 import hashlib
@@ -12,7 +20,7 @@ import time
 from datetime import datetime
 from typing import Generator, Optional
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -27,8 +35,11 @@ from app.logger import get_logger
 logger = get_logger("goszakup.parser")
 
 
+# ---------------------------------------------------------------------------
+# WebDriver
+# ---------------------------------------------------------------------------
+
 def _build_driver() -> webdriver.Chrome:
-    """Создать и вернуть Chrome WebDriver."""
     opts = Options()
     if HEADLESS:
         opts.add_argument("--headless=new")
@@ -51,289 +62,306 @@ def _build_driver() -> webdriver.Chrome:
     return driver
 
 
+def _wait_for_table(driver: webdriver.Chrome) -> bool:
+    """Ждём пока таблица лотов отрендерится JS-ом."""
+    try:
+        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "table tbody tr td")
+            )
+        )
+        # Дополнительно ждём исчезновения спиннера «Подождите, идет загрузка»
+        time.sleep(2)
+        return True
+    except Exception:
+        time.sleep(5)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Хеш и вспомогательные утилиты
+# ---------------------------------------------------------------------------
+
 def _make_hash(lot_number: str, announce_number: str, lot_name: str) -> str:
-    """Генерируем уникальный хеш SHA256 на основе ключевых полей."""
     raw = f"{lot_number}|{announce_number}|{lot_name}".lower().strip()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _parse_amount(text: str) -> Optional[float]:
-    """Парсим сумму из строки вида '1 234 567,89' или '1234567.89'."""
     if not text:
         return None
-    cleaned = re.sub(r"[^\d,.]", "", text).replace(",", ".")
+    cleaned = re.sub(r"[^\d,.]", "", text.strip()).replace(",", ".")
+    # Убираем лишние точки (разделители тысяч в формате "1.234.567.89")
+    parts = cleaned.split(".")
+    if len(parts) > 2:
+        cleaned = "".join(parts[:-1]) + "." + parts[-1]
     try:
-        return float(cleaned)
+        val = float(cleaned)
+        return val if val > 0 else None
     except ValueError:
         return None
 
 
-def _parse_date(text: str) -> Optional[datetime]:
-    """Парсим дату из разных форматов."""
-    if not text or text.strip() == "-":
-        return None
-    text = text.strip()
-    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_year(text: str) -> Optional[int]:
-    """Извлекаем год из строки."""
-    m = re.search(r"\b(20\d{2})\b", text or "")
-    return int(m.group(1)) if m else None
-
-
-def _wait_for_table(driver: webdriver.Chrome) -> bool:
-    """Ждём загрузки таблицы лотов."""
-    try:
-        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
-        )
-        return True
-    except Exception:
-        # Попробуем подождать через JS
-        time.sleep(5)
-        return False
-
-
-def _extract_rows_from_page(driver: webdriver.Chrome) -> list[dict]:
-    """
-    Извлечь все строки таблицы со текущей страницы.
-    Адаптивный парсер: определяем колонки по заголовкам.
-    """
-    soup = BeautifulSoup(driver.page_source, "lxml")
-
-    table = soup.find("table")
-    if not table:
-        logger.warning("Таблица не найдена на странице")
-        return []
-
-    # Определяем заголовки
-    header_row = table.find("thead")
-    headers = []
-    if header_row:
-        headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
-    logger.debug(f"Заголовки таблицы: {headers}")
-
-    rows = []
-    tbody = table.find("tbody")
-    if not tbody:
-        return []
-
-    for tr in tbody.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        if not cells:
-            continue
-
-        cell_texts = [c.get_text(separator=" ", strip=True) for c in cells]
-        # Получаем ссылку из строки (если есть)
-        link_tag = tr.find("a", href=True)
-        lot_url = None
-        if link_tag:
-            href = link_tag["href"]
-            if href.startswith("http"):
-                lot_url = href
-            else:
-                lot_url = "https://www.goszakup.gov.kz" + href
-
-        # Маппинг по индексам (типичная структура реестра лотов):
-        # 0 - №
-        # 1 - Номер лота
-        # 2 - Номер объявления
-        # 3 - Наименование лота
-        # 4 - Заказчик
-        # 5 - Способ закупки
-        # 6 - Статус
-        # 7 - Сумма
-        # 8 - Дата окончания
-        # (порядок может меняться, парсим по максимуму)
-
-        n = len(cell_texts)
-
-        def safe(i):
-            return cell_texts[i].strip() if i < n else ""
-
-        # Пробуем динамический маппинг через заголовки
-        if headers and len(headers) == n:
-            row_dict = dict(zip(headers, cell_texts))
-        else:
-            # Fallback — по позиции
-            row_dict = {}
-            for i, txt in enumerate(cell_texts):
-                row_dict[f"col_{i}"] = txt
-
-        row_dict["__url__"] = lot_url
-        row_dict["__raw__"] = cell_texts
-        rows.append(row_dict)
-
-    return rows
-
-
-def _normalize_row(row: dict, headers: list[str]) -> dict:
-    """
-    Нормализуем строку таблицы в структурированный словарь.
-    Поддерживаем как именованные заголовки, так и col_N формат.
-    """
-    def find_val(*keys) -> str:
-        """Ищем значение по списку возможных ключей (частичное совпадение)."""
-        for k in keys:
-            for h in row:
-                if k.lower() in h.lower():
-                    v = row[h]
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-        # fallback по col_N
-        mapping = {
-            "номер лота": 1,
-            "номер объявления": 2,
-            "наименование": 3,
-            "заказчик": 4,
-            "способ": 5,
-            "статус": 6,
-            "сумма": 7,
-            "окончани": 8,
-        }
-        for k in keys:
-            for kw, idx in mapping.items():
-                if kw in k.lower():
-                    v = row.get(f"col_{idx}", "")
-                    if v:
-                        return v
+def _clean_text(tag: Optional[Tag]) -> str:
+    if tag is None:
         return ""
+    return tag.get_text(separator=" ", strip=True)
 
-    lot_number = find_val("номер лота", "lot_number", "лот №")
-    announce_number = find_val("номер объявления", "объявлени", "announce")
-    lot_name = find_val("наименование", "описание", "лота", "name")
-    customer = find_val("заказчик", "customer", "организаци")
-    method = find_val("способ", "метод", "method")
-    status = find_val("статус", "status")
-    amount_raw = find_val("сумма", "amount", "цена", "стоимость")
-    deadline_raw = find_val("окончани", "deadline", "прием до", "прием по")
-    pub_date_raw = find_val("публикац", "дата", "опубликован")
-    year_raw = find_val("финансов", "год")
-    place = find_val("место", "поставк", "регион")
 
-    # BIN из имени заказчика (формат: "Название (БИН: 123456789012)")
-    customer_bin = None
-    bin_match = re.search(r"[\(\s](\d{12})[\)\s]", customer or "")
-    if bin_match:
-        customer_bin = bin_match.group(1)
+# ---------------------------------------------------------------------------
+# Парсинг одной строки таблицы
+# ---------------------------------------------------------------------------
 
-    # Уникальный хеш
+def _parse_row(tr: Tag) -> Optional[dict]:
+    """
+    Разбираем строку таблицы реестра лотов.
+
+    Структура ячейки [0] (первая колонка):
+      - Жирный текст: № лота (напр. "82073905-ЗЦП1")
+      - Ссылка на объявление: текст типа "16413510-1 Приобретение..."
+      - После ссылки: "Заказчик: ..."
+
+    Структура ячейки [1] (вторая колонка):
+      - Ссылка: наименование лота
+    """
+    cells = tr.find_all("td", recursive=False)
+    if len(cells) < 6:
+        return None
+
+    # --- Ячейка 0: № лота, объявление, заказчик ---
+    cell0 = cells[0]
+
+    # № лота — обычно первый жирный текст или первая строка
+    lot_number = ""
+    bold_tags = cell0.find_all(["b", "strong"])
+    if bold_tags:
+        lot_number = bold_tags[0].get_text(strip=True)
+    if not lot_number:
+        # Fallback: первая строка текста до переноса
+        raw_text = cell0.get_text(separator="\n", strip=True)
+        lot_number = raw_text.split("\n")[0].strip()
+
+    # Номер объявления — из href ссылки вида /ru/announce/index/16413510
+    announce_number = ""
+    announce_url = ""
+    lot_url = ""
+    announce_link = cell0.find("a", href=re.compile(r"/announce/index/"))
+    if announce_link:
+        announce_text = announce_link.get_text(strip=True)
+        # Текст: "16413510-1 Приобретение строительных товаров"
+        # Берём только номер (до первого пробела)
+        announce_number = announce_text.split()[0] if announce_text else ""
+        href = announce_link.get("href", "")
+        if href.startswith("/"):
+            announce_url = "https://www.goszakup.gov.kz" + href
+        else:
+            announce_url = href
+
+    # Наименование объявления (полный текст ссылки объявления)
+    announce_name = announce_link.get_text(strip=True) if announce_link else ""
+
+    # Заказчик — текст после "Заказчик:"
+    customer_name = ""
+    full_text = cell0.get_text(separator="\n", strip=True)
+    customer_match = re.search(r"Заказчик:\s*(.+)", full_text, re.DOTALL)
+    if customer_match:
+        customer_name = customer_match.group(1).strip().split("\n")[0].strip()
+
+    # --- Ячейка 1: наименование лота ---
+    cell1 = cells[1]
+    lot_name = ""
+    lot_link = cell1.find("a", href=re.compile(r"/subpriceoffer/index/|/announce/index/"))
+    if lot_link:
+        lot_name = lot_link.get_text(strip=True)
+        href = lot_link.get("href", "")
+        if href.startswith("/"):
+            lot_url = "https://www.goszakup.gov.kz" + href
+        else:
+            lot_url = href
+    else:
+        lot_name = _clean_text(cell1)
+
+    # --- Ячейка 2: Кол-во ---
+    quantity_str = _clean_text(cells[2])
+
+    # --- Ячейка 3: Сумма, тг. ---
+    amount_raw = _clean_text(cells[3])
+    purchase_amount = _parse_amount(amount_raw)
+
+    # --- Ячейка 4: Способ закупки ---
+    purchase_method = _clean_text(cells[4])
+
+    # --- Ячейка 5: Статус ---
+    status = _clean_text(cells[5])
+
+    # --- Уникальный хеш ---
     unique_hash = _make_hash(lot_number, announce_number, lot_name)
+
+    raw_data = json.dumps(
+        {
+            "lot_number": lot_number,
+            "announce_number": announce_number,
+            "announce_name": announce_name,
+            "lot_name": lot_name,
+            "customer_name": customer_name,
+            "quantity": quantity_str,
+            "amount": amount_raw,
+            "method": purchase_method,
+            "status": status,
+        },
+        ensure_ascii=False,
+    )
 
     return {
         "unique_hash": unique_hash,
         "lot_number": lot_number or None,
         "announce_number": announce_number or None,
         "lot_name": lot_name or None,
-        "subject_type": None,  # из фильтра, обычно не в таблице
+        "subject_type": None,
         "status": status or None,
-        "purchase_method": method or None,
-        "customer_name": customer or None,
-        "customer_bin": customer_bin,
-        "purchase_amount": _parse_amount(amount_raw),
-        "deadline_date": _parse_date(deadline_raw),
-        "publication_date": _parse_date(pub_date_raw),
-        "financial_year": _parse_year(year_raw),
-        "delivery_place": place or None,
-        "lot_url": row.get("__url__"),
-        "raw_data": json.dumps(row.get("__raw__", []), ensure_ascii=False),
+        "purchase_method": purchase_method or None,
+        "customer_name": customer_name or None,
+        "customer_bin": _extract_bin(customer_name),
+        "purchase_amount": purchase_amount,
+        "deadline_date": None,
+        "publication_date": None,
+        "financial_year": None,
+        "delivery_place": None,
+        "lot_url": lot_url or announce_url or None,
+        "raw_data": raw_data,
     }
 
 
-def _get_total_pages(driver: webdriver.Chrome) -> int:
-    """Определяем количество страниц пагинации."""
+def _extract_bin(customer_name: str) -> Optional[str]:
+    """Извлекаем 12-значный БИН из названия заказчика если есть."""
+    if not customer_name:
+        return None
+    m = re.search(r"\b(\d{12})\b", customer_name)
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Пагинация
+# ---------------------------------------------------------------------------
+
+def _get_total_pages(soup: BeautifulSoup) -> int:
+    """
+    Определяем количество страниц.
+    Сайт показывает "Показано c 1 по 50 из 10000 записей"
+    Значит: ceil(total / per_page) страниц.
+    """
     try:
-        soup = BeautifulSoup(driver.page_source, "lxml")
-        # Ищем пагинацию (Bootstrap-style: ul.pagination li a)
+        # Ищем текст "Показано c X по Y из Z записей"
+        text = soup.get_text()
+        m = re.search(r"Показано\s+c\s+\d+\s+по\s+(\d+)\s+из\s+([\d\s]+)\s+записей", text)
+        if m:
+            per_page = int(m.group(1))
+            total = int(m.group(2).replace(" ", ""))
+            import math
+            pages = math.ceil(total / per_page)
+            logger.info(f"Всего записей: {total}, на странице: {per_page}, страниц: {pages}")
+            return pages
+
+        # Fallback: ищем пагинацию Bootstrap
         pagination = soup.find("ul", class_=re.compile(r"pagination", re.I))
-        if not pagination:
-            return 1
-
-        page_numbers = []
-        for a in pagination.find_all("a"):
-            txt = a.get_text(strip=True)
-            if txt.isdigit():
-                page_numbers.append(int(txt))
-
-        # Также ищем в кнопке "последняя" / text содержащий число
-        last_link = pagination.find("a", string=re.compile(r"(посл|last|»)", re.I))
-        if last_link:
-            href = last_link.get("href", "")
-            m = re.search(r"[?&]page=(\d+)", href)
-            if m:
-                page_numbers.append(int(m.group(1)))
-
-        return max(page_numbers) if page_numbers else 1
+        if pagination:
+            nums = [
+                int(a.get_text(strip=True))
+                for a in pagination.find_all("a")
+                if a.get_text(strip=True).isdigit()
+            ]
+            if nums:
+                return max(nums)
     except Exception as e:
-        logger.warning(f"Не удалось определить число страниц: {e}")
-        return 1
+        logger.warning(f"Не удалось определить страниц: {e}")
+    return 1
 
 
-def _navigate_to_page(driver: webdriver.Chrome, page: int) -> bool:
-    """Переходим на нужную страницу."""
-    url = f"{BASE_URL}?page={page}"
-    try:
-        driver.get(url)
-        return _wait_for_table(driver)
-    except Exception as e:
-        logger.error(f"Ошибка при переходе на страницу {page}: {e}")
-        return False
+def _extract_rows_from_page(driver: webdriver.Chrome) -> list[dict]:
+    """Извлечь все лоты с текущей страницы."""
+    soup = BeautifulSoup(driver.page_source, "lxml")
 
+    # Ищем таблицу лотов (содержит нужные заголовки)
+    target_table = None
+    for table in soup.find_all("table"):
+        headers_text = table.get_text()
+        if "Способ закупки" in headers_text and "Статус" in headers_text:
+            target_table = table
+            break
+
+    if not target_table:
+        logger.warning("Таблица лотов не найдена на странице")
+        return []
+
+    tbody = target_table.find("tbody")
+    if not tbody:
+        return []
+
+    results = []
+    for tr in tbody.find_all("tr"):
+        parsed = _parse_row(tr)
+        if parsed:
+            results.append(parsed)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Основной генератор
+# ---------------------------------------------------------------------------
 
 def parse_all_lots() -> Generator[dict, None, None]:
     """
-    Генератор: обходит все страницы реестра лотов и отдаёт нормализованные строки.
+    Генератор: обходит ВСЕ страницы реестра лотов и отдаёт нормализованные лоты.
+    Сайт показывает максимум 10 000 записей (200 страниц × 50 записей).
     """
     driver = _build_driver()
     logger.info("WebDriver инициализирован")
 
     try:
-        # Загружаем первую страницу
-        logger.info(f"Загружаем {BASE_URL}")
+        logger.info(f"Загружаем первую страницу: {BASE_URL}")
         driver.get(BASE_URL)
         loaded = _wait_for_table(driver)
 
         if not loaded:
-            logger.warning("Таблица не загрузилась на первой странице. Проверьте сайт.")
+            logger.warning("Таблица не загрузилась. Ждём ещё 10 сек...")
+            time.sleep(10)
 
-        total_pages = _get_total_pages(driver)
-        logger.info(f"Всего страниц: {total_pages}")
+        soup_first = BeautifulSoup(driver.page_source, "lxml")
+        total_pages = _get_total_pages(soup_first)
 
         if MAX_PAGES > 0:
             total_pages = min(total_pages, MAX_PAGES)
-            logger.info(f"Ограничение MAX_PAGES={MAX_PAGES}, обработаем {total_pages} стр.")
+            logger.info(f"MAX_PAGES={MAX_PAGES}, обработаем {total_pages} стр.")
 
-        headers: list[str] = []
+        logger.info(f"Начинаем обход {total_pages} страниц...")
 
         for page_num in range(1, total_pages + 1):
-            logger.info(f"Парсим страницу {page_num}/{total_pages}")
-
             if page_num > 1:
-                ok = _navigate_to_page(driver, page_num)
-                if not ok:
-                    logger.warning(f"Страница {page_num} не загрузилась, пропускаем")
+                url = f"{BASE_URL}?page={page_num}"
+                logger.info(f"→ Страница {page_num}/{total_pages}: {url}")
+                try:
+                    driver.get(url)
+                    _wait_for_table(driver)
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки страницы {page_num}: {e}")
+                    time.sleep(5)
                     continue
-
-            # Небольшая пауза, чтобы не нагружать сервер
-            time.sleep(2)
+            else:
+                logger.info(f"→ Страница 1/{total_pages}")
 
             rows = _extract_rows_from_page(driver)
-            logger.info(f"  Страница {page_num}: найдено строк = {len(rows)}")
+            logger.info(f"  Найдено лотов: {len(rows)}")
 
-            # Собираем заголовки с первой страницы
-            if page_num == 1 and rows:
-                # headers уже внутри rows как ключи
-                headers = [k for k in rows[0].keys() if not k.startswith("__")]
+            if not rows:
+                logger.warning(f"  Страница {page_num} пуста — останавливаем обход")
+                break
 
             for row in rows:
-                normalized = _normalize_row(row, headers)
-                yield normalized
+                yield row
+
+            # Пауза между страницами — не перегружаем сервер
+            time.sleep(1.5)
 
     except Exception as e:
         logger.exception(f"Критическая ошибка парсера: {e}")
