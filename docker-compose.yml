@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: goszakup_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-goszakup}
+      MYSQL_USER: ${DB_USER:-goszakup_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-rootpassword}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  parser:
+    build: .
+    container_name: goszakup_parser
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DB_USER:-goszakup_user}
+      DB_PASSWORD: ${DB_PASSWORD:-rootpassword}
+      DB_NAME: ${DB_NAME:-goszakup}
+      PARSE_INTERVAL_HOURS: ${PARSE_INTERVAL_HOURS:-3}
+      HEADLESS: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+    command: python -m app.main
+
+volumes:
+  mysql_data:
