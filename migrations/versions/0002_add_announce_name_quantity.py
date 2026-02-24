@@ -1,5 +1,4 @@
 """Add announce_name and quantity columns
-
 Revision ID: 0002
 Revises: 0001
 Create Date: 2024-02-24 00:00:00.000000
