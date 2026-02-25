@@ -14,6 +14,7 @@
 """
 
 import os
+import platform
 import hashlib
 import json
 import re
@@ -57,12 +58,13 @@ def _build_driver() -> webdriver.Chrome:
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
-    if chromedriver_path:
-        service = Service(chromedriver_path)
-    else:
-        service = Service(ChromeDriverManager().install())
-
+    # chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+    #
+    # if platform.system() == "Linux":
+    #     service = Service(chromedriver_path)
+    # else:
+    #     service = Service(ChromeDriverManager().install())
+    service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
