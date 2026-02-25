@@ -4,8 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="d6a8d954-6491-46ea-8668-3d3d755c9b43" name="Changes" comment="-- fixed parser">
-      <change afterPath="$PROJECT_DIR$/migrations/versions/0003_delete_announce_name_quantity.py" afterDir="false" />
+    <list default="true" id="d6a8d954-6491-46ea-8668-3d3d755c9b43" name="Changes" comment="-- deleting not used columns in lots table">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/logs/parser_202602.log" beforeDir="false" afterPath="$PROJECT_DIR$/logs/parser_202602.log" afterDir="false" />
     </list>
@@ -84,7 +83,7 @@
       <option name="presentableId" value="Default" />
       <updated>1771899525608</updated>
       <workItem from="1771899526709" duration="4365000" />
-      <workItem from="1771947684415" duration="756000" />
+      <workItem from="1771947684415" duration="1641000" />
     </task>
     <task id="LOCAL-00001" summary="-- first commit">
       <option name="closed" value="true" />
@@ -134,7 +133,15 @@
       <option name="project" value="LOCAL" />
       <updated>1771932141352</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="-- deleting not used columns in lots table">
+      <option name="closed" value="true" />
+      <created>1771948661027</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1771948661028</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -154,6 +161,7 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="-- first commit" />
     <MESSAGE value="-- fixed parser" />
-    <option name="LAST_COMMIT_MESSAGE" value="-- fixed parser" />
+    <MESSAGE value="-- deleting not used columns in lots table" />
+    <option name="LAST_COMMIT_MESSAGE" value="-- deleting not used columns in lots table" />
   </component>
 </project>
